@@ -1,5 +1,6 @@
-#ifndef EVENTBUS_H
-#define EVENTBUS_H
+// File: src/core/EventBus.h
+#ifndef CORE_EVENTBUS_H
+#define CORE_EVENTBUS_H
 
 #include <Arduino.h>
 #include <functional>
@@ -22,19 +23,18 @@ struct Event {
 // Event handler function type
 using EventHandler = std::function<void(const Event&)>;
 
-// Event type constants
-namespace EventTypes {
-    // Sensor events
-    constexpr const char* SENSOR_TEMPERATURE = "sensor.temperature";
-    constexpr const char* SENSOR_HUMIDITY = "sensor.humidity";
-    constexpr const char* SENSOR_PRESSURE = "sensor.pressure";
+// Core event types (device-agnostic)
+namespace CoreEventTypes {
+    // Sensor events (generic)
+    constexpr const char* SENSOR_READING = "sensor.reading";
     constexpr const char* SENSOR_ERROR = "sensor.error";
+    constexpr const char* SENSOR_CONNECTED = "sensor.connected";
+    constexpr const char* SENSOR_DISCONNECTED = "sensor.disconnected";
     
-    // Actuator events
-    constexpr const char* ACTUATOR_LIGHTS_ON = "actuator.lights.on";
-    constexpr const char* ACTUATOR_LIGHTS_OFF = "actuator.lights.off";
-    constexpr const char* ACTUATOR_SPRAY_START = "actuator.spray.start";
-    constexpr const char* ACTUATOR_SPRAY_STOP = "actuator.spray.stop";
+    // Actuator events (generic)
+    constexpr const char* ACTUATOR_ACTIVATED = "actuator.activated";
+    constexpr const char* ACTUATOR_DEACTIVATED = "actuator.deactivated";
+    constexpr const char* ACTUATOR_ERROR = "actuator.error";
     
     // System events
     constexpr const char* SYSTEM_STARTUP = "system.startup";
@@ -47,6 +47,11 @@ namespace EventTypes {
     constexpr const char* COMMAND_RECEIVED = "command.received";
     constexpr const char* COMMAND_EXECUTED = "command.executed";
     constexpr const char* COMMAND_FAILED = "command.failed";
+    
+    // Configuration events
+    constexpr const char* CONFIG_LOADED = "config.loaded";
+    constexpr const char* CONFIG_CHANGED = "config.changed";
+    constexpr const char* CONFIG_SAVED = "config.saved";
 }
 
 // Thread-safe event bus for component communication
@@ -57,25 +62,48 @@ private:
     static EventBus* instance;
     
     EventBus();
-    void notifySubscribers(const Event& event);
+    
+    // Prevent copying
+    EventBus(const EventBus&) = delete;
+    EventBus& operator=(const EventBus&) = delete;
     
 public:
     static EventBus& getInstance();
     ~EventBus();
     
     // Subscribe to events of a specific type
-    void subscribe(const String& eventType, EventHandler handler);
+    bool subscribe(const String& eventType, EventHandler handler);
+    
+    // Unsubscribe from events (for cleanup)
+    bool unsubscribe(const String& eventType);
     
     // Publish event to all subscribers
     void publish(const Event& event);
     void publish(const String& eventType, const String& source, const String& data = "");
     
-    // Get subscriber count for debugging
+    // Diagnostics
     size_t getSubscriberCount(const String& eventType) const;
+    size_t getTotalEventTypes() const;
     void printSubscribers() const;
+    
+    // Cleanup
+    void shutdown();
 };
 
-// Global event bus instance
+// Global event bus instance access
 extern EventBus& eventBus;
 
-#endif // EVENTBUS_H
+// Helper macros for common event publishing
+#define PUBLISH_SENSOR_READING(sensorName, value, unit) \
+    eventBus.publish(CoreEventTypes::SENSOR_READING, sensorName, \
+    "{\"value\":" + String(value) + ",\"unit\":\"" + unit + "\"}")
+
+#define PUBLISH_ACTUATOR_STATE(actuatorName, state) \
+    eventBus.publish(state ? CoreEventTypes::ACTUATOR_ACTIVATED : CoreEventTypes::ACTUATOR_DEACTIVATED, \
+    actuatorName, "{\"state\":" + String(state ? "true" : "false") + "}")
+
+#define PUBLISH_SYSTEM_ERROR(component, message) \
+    eventBus.publish(CoreEventTypes::SYSTEM_ERROR, component, \
+    "{\"error\":\"" + message + "\"}")
+
+#endif // CORE_EVENTBUS_H

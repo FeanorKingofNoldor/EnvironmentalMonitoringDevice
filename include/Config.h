@@ -1,115 +1,157 @@
-#ifndef CONFIG_H
-#define CONFIG_H
+// File: src/core/Config.h
+#ifndef CORE_CONFIG_H
+#define CORE_CONFIG_H
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <vector>
+#include "BaseClasses.h"
+#include "EventBus.h"
 
-// Configuration structures
-struct SensorConfig {
-    String name;
-    String type;
-    int pin;
-    int i2cAddress;
-    bool enabled;
-    float calibrationOffset;
-    float calibrationScale;
-    
-    SensorConfig() : pin(-1), i2cAddress(0), enabled(false), 
-                     calibrationOffset(0.0), calibrationScale(1.0) {}
-};
-
-struct ActuatorConfig {
-    String name;
-    String type;
-    int pin;
-    bool enabled;
-    bool invertLogic;
-    int pulseWidthMs;
-    
-    ActuatorConfig() : pin(-1), enabled(false), invertLogic(false), pulseWidthMs(0) {}
-};
-
+// Network configuration
 struct NetworkConfig {
     String wifiSSID;
     String wifiPassword;
     String serverURL;
     String deviceToken;
-    int commandPollIntervalMs;
-    int dataUploadIntervalMs;
+    String deviceName;
+    unsigned long commandPollIntervalMs;
+    unsigned long dataUploadIntervalMs;
+    unsigned long connectionTimeoutMs;
     
-    NetworkConfig() : commandPollIntervalMs(5000), dataUploadIntervalMs(30000) {}
+    NetworkConfig() : wifiSSID(""), wifiPassword(""), serverURL(""), deviceToken(""), 
+                     deviceName(""), commandPollIntervalMs(5000), 
+                     dataUploadIntervalMs(30000), connectionTimeoutMs(10000) {}
 };
 
+// Safety configuration
 struct SafetyConfig {
-    float maxTemperature;
-    float minTemperature;
-    float maxHumidity;
-    float maxPressure;
     bool enableEmergencyShutdown;
+    float maxTemperatureC;
+    float minTemperatureC;
+    float maxHumidityPercent;
+    float maxPressurePSI;
+    unsigned long sensorTimeoutMs;
     
-    SafetyConfig() : maxTemperature(50.0), minTemperature(-10.0), 
-                     maxHumidity(95.0), maxPressure(100.0), 
-                     enableEmergencyShutdown(true) {}
+    SafetyConfig() : enableEmergencyShutdown(true), maxTemperatureC(50.0), 
+                    minTemperatureC(-10.0), maxHumidityPercent(95.0), 
+                    maxPressurePSI(100.0), sensorTimeoutMs(30000) {}
 };
 
-// Configuration manager class
-class Config {
-private:
-    JsonDocument configDoc;
-    bool isLoaded;
-    static const char* CONFIG_FILE_PATH;
+// Configuration validation result
+struct ValidationResult {
+    bool isValid;
+    std::vector<String> errors;
+    std::vector<String> warnings;
     
-    // File operations
+    ValidationResult() : isValid(true) {}
+    
+    void addError(const String& error) {
+        errors.push_back(error);
+        isValid = false;
+    }
+    
+    void addWarning(const String& warning) {
+        warnings.push_back(warning);
+    }
+    
+    bool hasIssues() const {
+        return !errors.empty() || !warnings.empty();
+    }
+};
+
+// Forward declaration for device capabilities
+class IDeviceCapabilities;
+
+// Core configuration manager
+class Config : public BaseManager {
+private:
+    static const String CONFIG_FILE;
+    static const size_t MAX_CONFIG_SIZE = 8192;
+    
+    JsonDocument configDoc;
+    const IDeviceCapabilities* deviceCapabilities;
+    bool isLoaded;
+    bool hasUnsavedChanges;
+    
+    // Internal methods
     bool loadFromFile();
     bool saveToFile();
     void createDefaultConfig();
+    ValidationResult validateConfig() const;
     
-    // Validation
-    bool validateConfig();
-    String getValidationErrors();
+    // Device-specific config creation
+    void createDeviceSensors(JsonArray& sensors);
+    void createDeviceActuators(JsonArray& actuators);
+    void createDeviceSafety(JsonObject& safety);
     
 public:
-    Config();
+    Config() : BaseManager("Config"), deviceCapabilities(nullptr), 
+               isLoaded(false), hasUnsavedChanges(false) {}
     
-    // Lifecycle
-    bool begin();
+    // BaseManager implementation
+    bool begin() override;
+    void shutdown() override;
+    
+    // Device capabilities injection
+    void setDeviceCapabilities(const IDeviceCapabilities* capabilities) {
+        deviceCapabilities = capabilities;
+    }
+    
+    // Configuration loading/saving
     bool load();
     bool save();
-    bool reset();
+    bool reload();
+    bool hasChanges() const { return hasUnsavedChanges; }
     
-    // Configuration sections
-    std::vector<SensorConfig> getSensors();
-    void setSensorConfig(const String& name, const SensorConfig& config);
+    // Configuration access
+    NetworkConfig getNetwork() const;
+    SafetyConfig getSafety() const;
+    std::vector<SensorConfig> getSensors() const;
+    std::vector<ActuatorConfig> getActuators() const;
     
-    std::vector<ActuatorConfig> getActuators();
-    void setActuatorConfig(const String& name, const ActuatorConfig& config);
+    // Configuration updates
+    bool updateNetwork(const NetworkConfig& network);
+    bool updateSafety(const SafetyConfig& safety);
+    bool updateSensor(const String& name, const SensorConfig& sensor);
+    bool updateActuator(const String& name, const ActuatorConfig& actuator);
     
-    NetworkConfig getNetwork();
-    void setNetwork(const NetworkConfig& config);
+    // Sensor/Actuator management
+    bool addSensor(const SensorConfig& sensor);
+    bool removeSensor(const String& name);
+    bool addActuator(const ActuatorConfig& actuator);
+    bool removeActuator(const String& name);
     
-    SafetyConfig getSafety();
-    void setSafety(const SafetyConfig& config);
-    
-    // Generic getters/setters
-    int getInt(const String& path, int defaultValue = 0);
-    float getFloat(const String& path, float defaultValue = 0.0);
-    String getString(const String& path, const String& defaultValue = "");
-    bool getBool(const String& path, bool defaultValue = false);
-    
-    void set(const String& path, int value);
-    void set(const String& path, float value);
-    void set(const String& path, const String& value);
-    void set(const String& path, bool value);
+    // Validation
+    ValidationResult validate() const;
+    bool isConfigValid() const;
     
     // Utilities
-    void printConfig();
-    size_t getConfigSize();
-    bool isConfigLoaded() const { return isLoaded; }
+    void printConfig() const;
+    size_t getConfigSize() const;
+    String getConfigHash() const;
+    
+    // Factory reset
+    bool resetToDefaults();
+    
+    // JSON access (for advanced use)
+    const JsonDocument& getJson() const { return configDoc; }
+    bool updateFromJson(const String& jsonString);
+    String exportToJson() const;
 };
 
 // Global configuration instance
 extern Config config;
 
-#endif // CONFIG_H
+// Configuration validation helpers
+namespace ConfigValidator {
+    bool isValidWiFiSSID(const String& ssid);
+    bool isValidURL(const String& url);
+    bool isValidPin(int pin);
+    bool isValidI2CAddress(int address);
+    bool isValidSensorName(const String& name);
+    bool isValidActuatorName(const String& name);
+}
+
+#endif // CORE_CONFIG_H

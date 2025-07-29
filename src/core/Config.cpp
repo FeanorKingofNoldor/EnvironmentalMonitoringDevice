@@ -1,53 +1,78 @@
+// File: src/core/Config.cpp
 #include "Config.h"
+#include "BaseClasses.h"
+#include <WiFi.h>
 
-Config config;
-const char* Config::CONFIG_FILE_PATH = "/config.json";
-
-Config::Config() : isLoaded(false) {}
+const String Config::CONFIG_FILE = "/config.json";
 
 bool Config::begin() {
+    setState(ManagerState::INITIALIZING);
+    initTime = millis();
+    
     Serial.println("Initializing configuration system...");
     
-    if (!LittleFS.begin(true)) {
-        Serial.println("ERROR: Failed to initialize LittleFS");
+    // Initialize filesystem
+    if (!LittleFS.begin()) {
+        setError("Failed to initialize LittleFS");
         return false;
     }
     
+    // Load configuration
     if (!load()) {
-        Serial.println("Creating default configuration...");
+        Serial.println("No valid config found, creating defaults");
         createDefaultConfig();
         if (!save()) {
-            Serial.println("ERROR: Failed to save default configuration");
+            setError("Failed to save default configuration");
             return false;
         }
     }
     
-    if (!validateConfig()) {
-        Serial.printf("WARNING: Configuration validation failed: %s\n", 
-                     getValidationErrors().c_str());
+    // Validate configuration
+    ValidationResult validation = validate();
+    if (!validation.isValid) {
+        Serial.println("Configuration validation failed:");
+        for (const String& error : validation.errors) {
+            Serial.println("  ERROR: " + error);
+        }
+        setError("Configuration validation failed");
+        return false;
     }
     
-    Serial.println("Configuration system initialized");
+    // Print warnings
+    for (const String& warning : validation.warnings) {
+        Serial.println("  WARNING: " + warning);
+    }
+    
+    setState(ManagerState::READY);
+    eventBus.publish(CoreEventTypes::CONFIG_LOADED, "Config", "{}");
+    
+    Serial.println("Configuration system ready");
     return true;
+}
+
+void Config::shutdown() {
+    if (hasUnsavedChanges) {
+        Serial.println("Saving configuration before shutdown...");
+        save();
+    }
+    
+    LittleFS.end();
+    setState(ManagerState::SHUTDOWN);
 }
 
 bool Config::load() {
     return loadFromFile();
 }
 
-bool Config::save() {
-    return saveToFile();
-}
-
-bool Config::reset() {
-    createDefaultConfig();
-    return save();
-}
-
 bool Config::loadFromFile() {
-    File file = LittleFS.open(CONFIG_FILE_PATH, "r");
-    if (!file) {
+    if (!LittleFS.exists(CONFIG_FILE)) {
         Serial.println("Configuration file not found");
+        return false;
+    }
+    
+    File file = LittleFS.open(CONFIG_FILE, "r");
+    if (!file) {
+        Serial.println("Failed to open configuration file for reading");
         return false;
     }
     
@@ -60,12 +85,17 @@ bool Config::loadFromFile() {
     }
     
     isLoaded = true;
-    Serial.println("Configuration loaded successfully");
+    hasUnsavedChanges = false;
+    Serial.printf("Configuration loaded (%d bytes)\n", configDoc.memoryUsage());
     return true;
 }
 
+bool Config::save() {
+    return saveToFile();
+}
+
 bool Config::saveToFile() {
-    File file = LittleFS.open(CONFIG_FILE_PATH, "w");
+    File file = LittleFS.open(CONFIG_FILE, "w");
     if (!file) {
         Serial.println("Failed to open configuration file for writing");
         return false;
@@ -79,12 +109,26 @@ bool Config::saveToFile() {
         return false;
     }
     
+    hasUnsavedChanges = false;
     Serial.printf("Configuration saved (%d bytes)\n", bytesWritten);
+    eventBus.publish(CoreEventTypes::CONFIG_SAVED, "Config", "{}");
     return true;
+}
+
+bool Config::reload() {
+    configDoc.clear();
+    isLoaded = false;
+    return load();
 }
 
 void Config::createDefaultConfig() {
     configDoc.clear();
+    
+    // Device info (will be overridden by device-specific implementation)
+    JsonObject device = configDoc["device"].to<JsonObject>();
+    device["type"] = "unknown";
+    device["name"] = "Unknown Device";
+    device["version"] = "1.0.0";
     
     // Network configuration
     JsonObject network = configDoc["network"].to<JsonObject>();
@@ -92,97 +136,77 @@ void Config::createDefaultConfig() {
     network["wifi_password"] = "";
     network["server_url"] = "http://localhost:3000";
     network["device_token"] = "";
+    network["device_name"] = "";
     network["command_poll_interval_ms"] = 5000;
     network["data_upload_interval_ms"] = 30000;
-    
-    // Sensor configuration
-    JsonArray sensors = configDoc["sensors"].to<JsonArray>();
-    
-    JsonObject tempSensor = sensors.add<JsonObject>();
-    tempSensor["name"] = "sht3x";
-    tempSensor["type"] = "SHT3x";
-    tempSensor["pin"] = -1;
-    tempSensor["i2c_address"] = 0x44;
-    tempSensor["enabled"] = true;
-    tempSensor["calibration_offset"] = 0.0;
-    tempSensor["calibration_scale"] = 1.0;
-    
-    JsonObject pressureSensor = sensors.add<JsonObject>();
-    pressureSensor["name"] = "pressure";
-    pressureSensor["type"] = "Analog";
-    pressureSensor["pin"] = 36;
-    pressureSensor["enabled"] = true;
-    pressureSensor["calibration_offset"] = 0.0;
-    pressureSensor["calibration_scale"] = 1.0;
-    
-    // Actuator configuration
-    JsonArray actuators = configDoc["actuators"].to<JsonArray>();
-    
-    JsonObject lightsRelay = actuators.add<JsonObject>();
-    lightsRelay["name"] = "lights";
-    lightsRelay["type"] = "Relay";
-    lightsRelay["pin"] = 23;
-    lightsRelay["enabled"] = true;
-    lightsRelay["invert_logic"] = false;
-    
-    JsonObject sprayRelay = actuators.add<JsonObject>();
-    sprayRelay["name"] = "spray";
-    sprayRelay["type"] = "Relay";
-    sprayRelay["pin"] = 22;
-    sprayRelay["enabled"] = true;
-    sprayRelay["invert_logic"] = false;
-    sprayRelay["pulse_width_ms"] = 5000;
+    network["connection_timeout_ms"] = 10000;
     
     // Safety configuration
     JsonObject safety = configDoc["safety"].to<JsonObject>();
-    safety["max_temperature"] = 50.0;
-    safety["min_temperature"] = -10.0;
-    safety["max_humidity"] = 95.0;
-    safety["max_pressure"] = 100.0;
     safety["enable_emergency_shutdown"] = true;
+    safety["max_temperature_c"] = 50.0;
+    safety["min_temperature_c"] = -10.0;
+    safety["max_humidity_percent"] = 95.0;
+    safety["max_pressure_psi"] = 100.0;
+    safety["sensor_timeout_ms"] = 30000;
+    
+    // Create device-specific configurations
+    JsonArray sensors = configDoc["sensors"].to<JsonArray>();
+    createDeviceSensors(sensors);
+    
+    JsonArray actuators = configDoc["actuators"].to<JsonArray>();
+    createDeviceActuators(actuators);
+    
+    createDeviceSafety(safety);
     
     isLoaded = true;
+    hasUnsavedChanges = true;
     Serial.println("Default configuration created");
 }
 
-std::vector<SensorConfig> Config::getSensors() {
-    std::vector<SensorConfig> sensors;
-    JsonArray sensorArray = configDoc["sensors"];
-    
-    for (JsonObject sensor : sensorArray) {
-        SensorConfig config;
-        config.name = sensor["name"].as<String>();
-        config.type = sensor["type"].as<String>();
-        config.pin = sensor["pin"];
-        config.i2cAddress = sensor["i2c_address"];
-        config.enabled = sensor["enabled"];
-        config.calibrationOffset = sensor["calibration_offset"];
-        config.calibrationScale = sensor["calibration_scale"];
-        sensors.push_back(config);
+void Config::createDeviceSensors(JsonArray& sensors) {
+    // Default implementation - override in device-specific config
+    if (deviceCapabilities) {
+        // Device will provide its own sensor defaults
+        // This is just a fallback
+        return;
     }
     
-    return sensors;
+    // Generic sensor as fallback
+    JsonObject tempSensor = sensors.add<JsonObject>();
+    tempSensor["name"] = "temperature";
+    tempSensor["type"] = "Generic";
+    tempSensor["pin"] = -1;
+    tempSensor["i2c_address"] = 0;
+    tempSensor["enabled"] = false;
+    tempSensor["calibration_offset"] = 0.0;
+    tempSensor["calibration_scale"] = 1.0;
+    tempSensor["read_interval_ms"] = 1000;
 }
 
-std::vector<ActuatorConfig> Config::getActuators() {
-    std::vector<ActuatorConfig> actuators;
-    JsonArray actuatorArray = configDoc["actuators"];
-    
-    for (JsonObject actuator : actuatorArray) {
-        ActuatorConfig config;
-        config.name = actuator["name"].as<String>();
-        config.type = actuator["type"].as<String>();
-        config.pin = actuator["pin"];
-        config.enabled = actuator["enabled"];
-        config.invertLogic = actuator["invert_logic"];
-        config.pulseWidthMs = actuator["pulse_width_ms"];
-        actuators.push_back(config);
+void Config::createDeviceActuators(JsonArray& actuators) {
+    // Default implementation - override in device-specific config
+    if (deviceCapabilities) {
+        // Device will provide its own actuator defaults
+        return;
     }
     
-    return actuators;
+    // Generic actuator as fallback
+    JsonObject relay = actuators.add<JsonObject>();
+    relay["name"] = "relay1";
+    relay["type"] = "Generic";
+    relay["pin"] = -1;
+    relay["enabled"] = false;
+    relay["invert_logic"] = false;
+    relay["pulse_width_ms"] = 0;
 }
 
-NetworkConfig Config::getNetwork() {
+void Config::createDeviceSafety(JsonObject& safety) {
+    // Device-specific safety settings can be added here
+    // Base implementation already set in createDefaultConfig
+}
+
+NetworkConfig Config::getNetwork() const {
     NetworkConfig network;
     JsonObject net = configDoc["network"];
     
@@ -190,44 +214,191 @@ NetworkConfig Config::getNetwork() {
     network.wifiPassword = net["wifi_password"].as<String>();
     network.serverURL = net["server_url"].as<String>();
     network.deviceToken = net["device_token"].as<String>();
-    network.commandPollIntervalMs = net["command_poll_interval_ms"];
-    network.dataUploadIntervalMs = net["data_upload_interval_ms"];
+    network.deviceName = net["device_name"].as<String>();
+    network.commandPollIntervalMs = net["command_poll_interval_ms"] | 5000;
+    network.dataUploadIntervalMs = net["data_upload_interval_ms"] | 30000;
+    network.connectionTimeoutMs = net["connection_timeout_ms"] | 10000;
     
     return network;
 }
 
-SafetyConfig Config::getSafety() {
+SafetyConfig Config::getSafety() const {
     SafetyConfig safety;
     JsonObject saf = configDoc["safety"];
     
-    safety.maxTemperature = saf["max_temperature"];
-    safety.minTemperature = saf["min_temperature"];
-    safety.maxHumidity = saf["max_humidity"];
-    safety.maxPressure = saf["max_pressure"];
-    safety.enableEmergencyShutdown = saf["enable_emergency_shutdown"];
+    safety.enableEmergencyShutdown = saf["enable_emergency_shutdown"] | true;
+    safety.maxTemperatureC = saf["max_temperature_c"] | 50.0;
+    safety.minTemperatureC = saf["min_temperature_c"] | -10.0;
+    safety.maxHumidityPercent = saf["max_humidity_percent"] | 95.0;
+    safety.maxPressurePSI = saf["max_pressure_psi"] | 100.0;
+    safety.sensorTimeoutMs = saf["sensor_timeout_ms"] | 30000;
     
     return safety;
 }
 
-bool Config::validateConfig() {
-    // Basic validation - could be expanded
-    return configDoc.containsKey("network") && 
-           configDoc.containsKey("sensors") && 
-           configDoc.containsKey("actuators") &&
-           configDoc.containsKey("safety");
+std::vector<SensorConfig> Config::getSensors() const {
+    std::vector<SensorConfig> sensors;
+    JsonArray sensorArray = configDoc["sensors"];
+    
+    for (JsonObject sensor : sensorArray) {
+        SensorConfig config;
+        config.name = sensor["name"].as<String>();
+        config.type = sensor["type"].as<String>();
+        config.pin = sensor["pin"] | -1;
+        config.i2cAddress = sensor["i2c_address"] | 0;
+        config.enabled = sensor["enabled"] | false;
+        config.calibrationOffset = sensor["calibration_offset"] | 0.0;
+        config.calibrationScale = sensor["calibration_scale"] | 1.0;
+        config.readIntervalMs = sensor["read_interval_ms"] | 1000;
+        sensors.push_back(config);
+    }
+    
+    return sensors;
 }
 
-String Config::getValidationErrors() {
-    // Placeholder for detailed validation
-    return "Basic structure validation";
+std::vector<ActuatorConfig> Config::getActuators() const {
+    std::vector<ActuatorConfig> actuators;
+    JsonArray actuatorArray = configDoc["actuators"];
+    
+    for (JsonObject actuator : actuatorArray) {
+        ActuatorConfig config;
+        config.name = actuator["name"].as<String>();
+        config.type = actuator["type"].as<String>();
+        config.pin = actuator["pin"] | -1;
+        config.enabled = actuator["enabled"] | false;
+        config.invertLogic = actuator["invert_logic"] | false;
+        config.pulseWidthMs = actuator["pulse_width_ms"] | 0;
+        actuators.push_back(config);
+    }
+    
+    return actuators;
 }
 
-void Config::printConfig() {
-    Serial.println("Current Configuration:");
+ValidationResult Config::validate() const {
+    ValidationResult result;
+    
+    // Validate network configuration
+    NetworkConfig network = getNetwork();
+    if (network.serverURL.isEmpty()) {
+        result.addWarning("Server URL not configured");
+    } else if (!ConfigValidator::isValidURL(network.serverURL)) {
+        result.addError("Invalid server URL format");
+    }
+    
+    if (network.wifiSSID.length() > 32) {
+        result.addError("WiFi SSID too long (max 32 characters)");
+    }
+    
+    if (network.wifiPassword.length() > 64) {
+        result.addError("WiFi password too long (max 64 characters)");
+    }
+    
+    // Validate sensors
+    std::vector<SensorConfig> sensors = getSensors();
+    for (const auto& sensor : sensors) {
+        if (!sensor.enabled) continue;
+        
+        if (!ConfigValidator::isValidSensorName(sensor.name)) {
+            result.addError("Invalid sensor name: " + sensor.name);
+        }
+        
+        if (sensor.pin != -1 && !ConfigValidator::isValidPin(sensor.pin)) {
+            result.addError("Invalid pin for sensor " + sensor.name + ": " + String(sensor.pin));
+        }
+        
+        if (sensor.i2cAddress != 0 && !ConfigValidator::isValidI2CAddress(sensor.i2cAddress)) {
+            result.addError("Invalid I2C address for sensor " + sensor.name + ": 0x" + String(sensor.i2cAddress, HEX));
+        }
+        
+        // Device-specific validation
+        if (deviceCapabilities && !deviceCapabilities->validateSensorConfig(sensor)) {
+            result.addError("Device validation failed for sensor: " + sensor.name);
+        }
+    }
+    
+    // Validate actuators
+    std::vector<ActuatorConfig> actuators = getActuators();
+    for (const auto& actuator : actuators) {
+        if (!actuator.enabled) continue;
+        
+        if (!ConfigValidator::isValidActuatorName(actuator.name)) {
+            result.addError("Invalid actuator name: " + actuator.name);
+        }
+        
+        if (!ConfigValidator::isValidPin(actuator.pin)) {
+            result.addError("Invalid pin for actuator " + actuator.name + ": " + String(actuator.pin));
+        }
+        
+        // Device-specific validation
+        if (deviceCapabilities && !deviceCapabilities->validateActuatorConfig(actuator)) {
+            result.addError("Device validation failed for actuator: " + actuator.name);
+        }
+    }
+    
+    return result;
+}
+
+bool Config::isConfigValid() const {
+    return validate().isValid;
+}
+
+void Config::printConfig() const {
+    Serial.println("=== Current Configuration ===");
     serializeJsonPretty(configDoc, Serial);
-    Serial.println();
+    Serial.println("\n=============================");
 }
 
-size_t Config::getConfigSize() {
+size_t Config::getConfigSize() const {
     return measureJson(configDoc);
+}
+
+String Config::getConfigHash() const {
+    // Simple hash based on config size and first few bytes
+    String configStr;
+    serializeJson(configDoc, configStr);
+    
+    uint32_t hash = 0;
+    for (char c : configStr) {
+        hash = hash * 31 + c;
+    }
+    
+    return String(hash, HEX);
+}
+
+bool Config::resetToDefaults() {
+    Serial.println("Resetting configuration to defaults...");
+    createDefaultConfig();
+    return save();
+}
+
+// Global instance
+Config config;
+
+// Validation helpers implementation
+namespace ConfigValidator {
+    bool isValidWiFiSSID(const String& ssid) {
+        return !ssid.isEmpty() && ssid.length() <= 32;
+    }
+    
+    bool isValidURL(const String& url) {
+        return url.startsWith("http://") || url.startsWith("https://");
+    }
+    
+    bool isValidPin(int pin) {
+        return pin >= 0 && pin <= 39; // ESP32 pin range
+    }
+    
+    bool isValidI2CAddress(int address) {
+        return address >= 0x08 && address <= 0x77; // Valid I2C address range
+    }
+    
+    bool isValidSensorName(const String& name) {
+        return !name.isEmpty() && name.length() <= 32 && 
+               name.indexOf(' ') == -1; // No spaces
+    }
+    
+    bool isValidActuatorName(const String& name) {
+        return !name.isEmpty() && name.length() <= 32 && 
+               name.indexOf(' ') == -1; // No spaces
+    }
 }
